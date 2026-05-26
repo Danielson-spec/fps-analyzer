@@ -8,13 +8,15 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QTabWidget,
     QTableWidget,
-    QTableWidgetItem
+    QTableWidgetItem,
+    QProgressBar
 )
 from PySide6.QtGui import QFont
 from PySide6.QtCore import Qt
 import os
 
 from analyzer.video_analyzer import VideoAnalyzer
+from worker.analysis_worker import AnalysisWorker
 from database.db import Database
 from utils.exporters import export_analysis_csv, create_report_pdf
 
@@ -42,6 +44,7 @@ class MainWindow(QWidget):
         self.database = Database()
         self.current_data = None
         self.current_video_name = None
+        self.worker_thread = None
         
         self.init_ui()
 
@@ -97,6 +100,33 @@ class MainWindow(QWidget):
         
         layout.addLayout(btn_layout)
         
+        # Barra de progreso (oculta inicialmente)
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setVisible(False)
+        self.progress_bar.setStyleSheet("""
+            QProgressBar {
+                border: 2px solid #2196F3;
+                border-radius: 5px;
+                text-align: center;
+                height: 25px;
+            }
+            QProgressBar::chunk {
+                background-color: #2196F3;
+            }
+        """)
+        layout.addWidget(self.progress_bar)
+        
+        # Etiqueta de estado
+        self.status_label = QLabel("")
+        self.status_label.setVisible(False)
+        self.status_label.setStyleSheet("""
+            QLabel {
+                color: #1976D2;
+                font-weight: bold;
+            }
+        """)
+        layout.addWidget(self.status_label)
+        
         # Estadísticas
         self.stats = QLabel("Carga un vídeo para ver el análisis")
         self.stats.setAlignment(Qt.AlignTop)
@@ -128,10 +158,11 @@ class MainWindow(QWidget):
         layout.addWidget(btn_refresh)
         
         self.history_table = QTableWidget()
-        self.history_table.setColumnCount(8)
+        self.history_table.setColumnCount(10)
         self.history_table.setHorizontalHeaderLabels([
-            "Video", "FPS", "Duración (s)", "Movimiento Medio",
-            "Estabilidad (%)", "Flicks", "Puntuación Tracking", "Fecha"
+            "Video", "FPS", "Duración (s)", "Avg Flow",
+            "Max Flow", "Estabilidad (%)", "Flicks", 
+            "Tracking (%)", "Rating", "Fecha"
         ])
         layout.addWidget(self.history_table)
         
@@ -139,7 +170,7 @@ class MainWindow(QWidget):
         return widget
 
     def load_video(self):
-        """Carga un vídeo y realiza el análisis."""
+        """Carga un vídeo y realiza el análisis en un thread separado."""
         
         file_path, _ = QFileDialog.getOpenFileName(
             self,
@@ -151,13 +182,34 @@ class MainWindow(QWidget):
         if not file_path:
             return
 
+        # Mostrar barra de progreso
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(0)
+        self.status_label.setVisible(True)
+        self.status_label.setText("Analizando vídeo...")
+        self.btn_load.setEnabled(False)
+        
+        # Crear y ejecutar worker thread
+        self.worker_thread = AnalysisWorker(file_path)
+        self.worker_thread.progress.connect(self.update_progress)
+        self.worker_thread.finished.connect(self.on_analysis_finished)
+        self.worker_thread.error.connect(self.on_analysis_error)
+        self.worker_thread.start()
+        
+        self.current_video_name = os.path.basename(file_path)
+
+    def update_progress(self, progress_value):
+        """Actualiza la barra de progreso."""
+        self.progress_bar.setValue(progress_value)
+        self.status_label.setText(f"Analizando vídeo... {progress_value}%")
+
+    def on_analysis_finished(self, result):
+        """Se ejecuta cuando el análisis termina."""
         try:
-            self.current_video_name = os.path.basename(file_path)
-            result = self.analyzer.analyze(file_path)
             self.current_data = result
             
             self.update_stats(result)
-            self.update_graph(result["motion_data"])
+            self.update_graph(result)
             
             # Guardar en base de datos
             self.database.save_analysis(result, self.current_video_name)
@@ -168,49 +220,102 @@ class MainWindow(QWidget):
             
             # Actualizar historial
             self.refresh_history()
+            
+            # Ocultar progreso
+            self.progress_bar.setVisible(False)
+            self.status_label.setText("✅ Análisis completado")
+            self.status_label.setStyleSheet("QLabel { color: #4CAF50; font-weight: bold; }")
+            
+            # Volver a habilitar botón
+            self.btn_load.setEnabled(True)
+            
+            # Ir a pestaña de análisis
             self.tabs.setCurrentIndex(0)
-
+            
         except Exception as e:
-            QMessageBox.critical(
-                self,
-                "Error",
-                f"Error al analizar el vídeo: {str(e)}"
-            )
+            self.on_analysis_error(str(e))
+
+    def on_analysis_error(self, error_msg):
+        """Maneja errores del análisis."""
+        QMessageBox.critical(
+            self,
+            "Error",
+            f"Error al analizar el vídeo: {error_msg}"
+        )
+        self.progress_bar.setVisible(False)
+        self.status_label.setVisible(False)
+        self.btn_load.setEnabled(True)
 
     def update_stats(self, data):
         """Actualiza las estadísticas mostradas."""
         
         text = f"""
 VÍDEO: {self.current_video_name}
-─────────────────────────────────────
-FPS: {data['fps']}
-Duración: {data['duration']} segundos
-Frames: {data['frames']}
-─────────────────────────────────────
-MOVIMIENTO:
-  • Media: {data['avg_motion']}
-  • Máximo: {data['max_motion']}
+{'─' * 50}
+INFORMACIÓN:
+  • FPS: {data['fps']}
+  • Duración: {data['duration']} segundos
+  • Frames: {data['frames']}
+
+{'─' * 50}
+MOVIMIENTO (Optical Flow):
+  • Flujo Promedio: {data['avg_flow']}
+  • Flujo Máximo: {data['max_flow']}
+  • Desviación Estándar: {data['std_flow']}
   • Estabilidad: {data['stability']}%
   • Flicks detectados: {data['flicks']}
-─────────────────────────────────────
+
+{'─' * 50}
 PUNTUACIONES:
   • Tracking: {data['tracking_score']}%
   • Picos de movimiento: {data['motion_peaks']}
+  • Cambios bruscos: {data['sharp_changes']}
   • Rating: {data['rating']}
 """
         
         self.stats.setText(text)
 
-    def update_graph(self, motion_data):
-        """Actualiza el gráfico de movimiento."""
+    def update_graph(self, data):
+        """Actualiza el gráfico de movimiento con Optical Flow."""
         
         self.canvas.ax.clear()
-        self.canvas.ax.plot(motion_data, linewidth=1.5, color='#2196F3')
-        self.canvas.ax.fill_between(range(len(motion_data)), motion_data, alpha=0.3, color='#2196F3')
-        self.canvas.ax.set_title("Movimiento de Cámara a lo largo del video", fontsize=14, fontweight='bold')
+        
+        # Graficar flujo óptico (principal)
+        self.canvas.ax.plot(
+            data['flow_data'],
+            linewidth=2,
+            color='#2196F3',
+            label='Optical Flow'
+        )
+        self.canvas.ax.fill_between(
+            range(len(data['flow_data'])),
+            data['flow_data'],
+            alpha=0.3,
+            color='#2196F3'
+        )
+        
+        # Marcar cambios bruscos
+        if data['sharp_change_indices']:
+            sharp_y = [data['flow_data'][i] for i in data['sharp_change_indices']]
+            self.canvas.ax.scatter(
+                data['sharp_change_indices'],
+                sharp_y,
+                color='red',
+                s=50,
+                marker='v',
+                label='Cambios Bruscos',
+                zorder=5
+            )
+        
+        self.canvas.ax.set_title(
+            "Movimiento de Cámara (Optical Flow) a lo largo del video",
+            fontsize=14,
+            fontweight='bold'
+        )
         self.canvas.ax.set_xlabel("Frame")
-        self.canvas.ax.set_ylabel("Intensidad de Movimiento")
+        self.canvas.ax.set_ylabel("Magnitud de Flujo Óptico")
         self.canvas.ax.grid(True, alpha=0.3)
+        self.canvas.ax.legend(loc='upper right')
         self.canvas.figure.tight_layout()
         self.canvas.draw()
 
@@ -251,10 +356,12 @@ PUNTUACIONES:
                 str(analysis[1]),  # video_name
                 str(analysis[2]),  # fps
                 str(analysis[3]),  # duration
-                str(analysis[4]),  # avg_motion
+                str(analysis[4]),  # avg_motion (ahora avg_flow)
+                str(analysis[5]),  # max_motion (ahora max_flow)
                 str(analysis[6]),  # stability
                 str(analysis[7]),  # flicks
-                "N/A",             # tracking_score (si quieres guardarlo, modificar DB)
+                "N/A",             # tracking_score
+                "N/A",             # rating
                 str(analysis[8])   # created_at
             ]
             
